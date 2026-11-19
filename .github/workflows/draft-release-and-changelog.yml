@@ -1,0 +1,34 @@
+name: Draft Releaser From Master
+
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - master
+
+jobs:
+  create_draft_release:
+    if: github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'master' && github.event.pull_request.head.ref == 'staging'
+    name: Create Draft Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout sandbox markers
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .mock
+          persist-credentials: false
+      - name: Mock create_draft_release
+        working-directory: ${{ github.workspace }}
+        env:
+          MOCK_JOB: create_draft_release
+          MOCK_MATRIX: ${{ toJSON(matrix) }}
+        run: |
+          echo "mock: $GITHUB_WORKFLOW / $MOCK_JOB on $GITHUB_EVENT_NAME at $GITHUB_SHA"
+          echo "matrix: $MOCK_MATRIX"
+          sleep "$(cat .mock/sleep 2>/dev/null || echo 15)"
+          if [ -f .mock/fail ] && grep -qxE "($GITHUB_EVENT_NAME/)?$MOCK_JOB" .mock/fail; then
+            echo "::error::.mock/fail makes $MOCK_JOB fail on $GITHUB_EVENT_NAME"
+            exit 1
+          fi

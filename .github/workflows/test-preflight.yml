@@ -1,0 +1,249 @@
+name: Test Preflight
+
+on:
+  workflow_call:
+    inputs:
+      go-checks:
+        description: 'Run lint + gosec with the Go cache job. The suite that owns the checks sets it; the others just consume the cache.'
+        required: false
+        default: false
+        type: boolean
+    outputs:
+      drivers:
+        description: 'JSON array of drivers the caller should fan its matrix out over; [] means nothing to test.'
+        value: ${{ jobs.preflight.outputs.drivers }}
+      sources:
+        description: 'JSON array of source stacks: one entry per driver, plus one per alternate server compose file.'
+        value: ${{ jobs.preflight.outputs.sources }}
+      drivers-with-compatibility-tests:
+        description: 'JSON array of drivers whose tests define a compatibility test and, on a PR, that exist at the base commit.'
+        value: ${{ jobs.preflight.outputs.drivers-with-compatibility-tests }}
+      base-image-misses:
+        description: 'JSON array of drivers whose base branch image is not in the registry yet; [] or empty means nothing to build.'
+        value: ${{ jobs.preflight.outputs.base-image-misses }}
+      redundant:
+        description: 'true when a merge queue entry repeats a passed PR run on the same base, so the heavy jobs can skip.'
+        value: ${{ jobs.preflight.outputs.redundant }}
+
+jobs:
+  preflight:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+      packages: read
+      actions: read
+    outputs:
+      drivers: ${{ steps.drivers.outputs.drivers }}
+      sources: ${{ steps.sources.outputs.sources }}
+      drivers-with-compatibility-tests: ${{ steps.compat.outputs.drivers }}
+      jar-cached: ${{ steps.jar-cache.outputs.cache-hit }}
+      go-cached: ${{ steps.go-cache.outputs.cache-hit }}
+      go-checks-changed: ${{ steps.go-checks.outputs.changed }}
+      base-image-misses: ${{ steps.base-images.outputs.misses }}
+      redundant: ${{ steps.redundant.outputs.redundant }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # The PR run leaves the base commit it tested against; the queue run compares it (next step).
+      - name: Record the base this PR run tests against
+        if: github.event_name == 'pull_request'
+        run: git rev-parse HEAD^1 > tested-base
+
+      - name: Upload tested base
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v7
+        with:
+          name: tested-base-${{ github.event.pull_request.head.sha }}
+          path: tested-base
+          overwrite: true
+          retention-days: 14
+
+      - name: Detect a queue entry that repeats a passed PR run
+        id: redundant
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MERGE_GROUP_HEAD_REF: ${{ github.event.merge_group.head_ref }}
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+        run: echo "redundant=$(.github/scripts/redundant-queue-run.sh)" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve driver matrix
+        id: drivers
+        uses: ./.github/actions/detect-drivers
+
+      - name: Resolve source stacks
+        id: sources
+        env:
+          DRIVERS: ${{ steps.drivers.outputs.drivers }}
+        run: |
+          set -euo pipefail
+          sources=$(jq -c '[.[] | {name: ., driver: .}]' <<<"$DRIVERS")
+          shopt -s nullglob
+          for override in drivers/*/docker-compose.*.yml; do
+            driver=$(basename "$(dirname "$override")")
+            suffix=$(basename "$override" .yml)
+            suffix=${suffix#docker-compose.}
+            jq -e --arg d "$driver" 'index($d)' <<<"$DRIVERS" >/dev/null || continue
+            sources=$(jq -c --arg n "$driver-$suffix" --arg d "$driver" \
+              --arg m "SOURCE_COMPOSE_$driver=$override EXPECT_VERSION=$suffix" \
+              '. + [{name: $n, driver: $d, make_vars: $m}]' <<<"$sources")
+          done
+          echo "sources=$sources" >> "$GITHUB_OUTPUT"
+          echo "Source stacks: $sources"
+
+      - name: Resolve drivers with backward compatibility test
+        id: compat
+        env:
+          DRIVERS: ${{ steps.drivers.outputs.drivers }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          REQUIRED_DRIVERS: '["db2","kafka","mongodb","mssql","mysql","oracle","postgres","s3"]'
+        run: |
+          set -euo pipefail
+          drivers=$(for d in $(jq -r '.[]' <<<"$DRIVERS"); do
+            grep -qsE '^func Test[A-Za-z0-9_]*Compatibility\(' tests/"$d"/*_test.go || continue
+            [ -z "$BASE_SHA" ] || git cat-file -e "$BASE_SHA:drivers/$d/go.mod" 2>/dev/null || continue
+            echo "$d"
+          done | jq -Rsc 'split("\n") | map(select(length > 0))')
+          echo "drivers=$drivers" >> "$GITHUB_OUTPUT"
+          echo "Compatibility drivers: $drivers"
+          missing=$(jq -r --argjson affected "$DRIVERS" --argjson found "$drivers" \
+            'map(select(IN($affected[]))) - $found | .[]' <<<"$REQUIRED_DRIVERS")
+          for d in $missing; do
+            echo "::error::$d is in REQUIRED_DRIVERS but missing from the compatibility matrix: tests/$d has no test for backwards compatibility"
+          done
+          [ -z "$missing" ]
+
+      - name: Detect go-check input changes
+        id: go-checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GO_CHECK_PATHS: |
+            tests/**/*.go
+            tests/**/go.mod
+            tests/**/go.sum
+            tests/go.work
+            tests/go.work.sum
+            Makefile
+            drivers/*/driver.mk
+            .golangci.yml
+            .github/workflows/test-preflight.yml
+            .github/workflows/tests.yml
+        run: |
+          changed=$(.github/scripts/changed-in-paths.sh <<<"$GO_CHECK_PATHS")
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          echo "Go-check inputs changed: $changed"
+
+      - name: Look up base branch images
+        id: base-images
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+        env:
+          DOCKER_CLI_EXPERIMENTAL: enabled
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          DRIVERS: ${{ steps.compat.outputs.drivers }}
+        run: |
+          set -euo pipefail
+          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          tag=$(git rev-parse --short "$BASE_SHA")
+          misses=$(for d in $(jq -r '.[]' <<<"$DRIVERS"); do
+            if docker manifest inspect "ghcr.io/$GITHUB_REPOSITORY/source-$d:$tag" >/dev/null 2>&1; then
+              echo "cached: source-$d:$tag" >&2
+            else
+              echo "$d"
+            fi
+          done | jq -Rsc 'split("\n") | map(select(length > 0))')
+          echo "misses=$misses" >> "$GITHUB_OUTPUT"
+          echo "base branch images to build at $tag: $misses"
+
+      - name: Look up Iceberg writer jar cache
+        id: jar-cache
+        uses: ./.github/actions/iceberg-jar
+        with:
+          mode: lookup
+
+      - name: Look up Go module + build cache
+        id: go-cache
+        uses: ./.github/actions/go-caches
+        with:
+          mode: lookup
+
+  build-jar:
+    name: Build Iceberg writer jar
+    needs: preflight
+    if: needs.preflight.outputs.drivers != '[]' && needs.preflight.outputs.jar-cached != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout sandbox markers
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .mock
+          persist-credentials: false
+      - name: Mock build-jar
+        working-directory: ${{ github.workspace }}
+        env:
+          MOCK_JOB: build-jar
+          MOCK_MATRIX: ${{ toJSON(matrix) }}
+        run: |
+          echo "mock: $GITHUB_WORKFLOW / $MOCK_JOB on $GITHUB_EVENT_NAME at $GITHUB_SHA"
+          echo "matrix: $MOCK_MATRIX"
+          sleep "$(cat .mock/sleep 2>/dev/null || echo 15)"
+          if [ -f .mock/fail ] && grep -qxE "($GITHUB_EVENT_NAME/)?$MOCK_JOB" .mock/fail; then
+            echo "::error::.mock/fail makes $MOCK_JOB fail on $GITHUB_EVENT_NAME"
+            exit 1
+          fi
+  apt-warm:
+    name: Warm base docker layers
+    needs: preflight
+    if: needs.preflight.outputs.drivers != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout sandbox markers
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .mock
+          persist-credentials: false
+      - name: Mock apt-warm
+        working-directory: ${{ github.workspace }}
+        env:
+          MOCK_JOB: apt-warm
+          MOCK_MATRIX: ${{ toJSON(matrix) }}
+        run: |
+          echo "mock: $GITHUB_WORKFLOW / $MOCK_JOB on $GITHUB_EVENT_NAME at $GITHUB_SHA"
+          echo "matrix: $MOCK_MATRIX"
+          sleep "$(cat .mock/sleep 2>/dev/null || echo 15)"
+          if [ -f .mock/fail ] && grep -qxE "($GITHUB_EVENT_NAME/)?$MOCK_JOB" .mock/fail; then
+            echo "::error::.mock/fail makes $MOCK_JOB fail on $GITHUB_EVENT_NAME"
+            exit 1
+          fi
+  go-cache:
+    name: Go checks + cache
+    needs: preflight
+    if: needs.preflight.outputs.drivers != '[]' && (needs.preflight.outputs.go-cached != 'true' || needs.preflight.outputs.go-checks-changed == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout sandbox markers
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .mock
+          persist-credentials: false
+      - name: Mock go-cache
+        working-directory: ${{ github.workspace }}
+        env:
+          MOCK_JOB: go-cache
+          MOCK_MATRIX: ${{ toJSON(matrix) }}
+        run: |
+          echo "mock: $GITHUB_WORKFLOW / $MOCK_JOB on $GITHUB_EVENT_NAME at $GITHUB_SHA"
+          echo "matrix: $MOCK_MATRIX"
+          sleep "$(cat .mock/sleep 2>/dev/null || echo 15)"
+          if [ -f .mock/fail ] && grep -qxE "($GITHUB_EVENT_NAME/)?$MOCK_JOB" .mock/fail; then
+            echo "::error::.mock/fail makes $MOCK_JOB fail on $GITHUB_EVENT_NAME"
+            exit 1
+          fi

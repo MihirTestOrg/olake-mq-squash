@@ -1,0 +1,62 @@
+name: Go Build and Lint
+on:
+  push:
+    branches:
+      - "master"
+  pull_request:
+    branches:
+      - "*"
+  merge_group:
+    types: [checks_requested]
+  workflow_dispatch:
+    inputs:
+      logLevel:
+        description: "Log level"
+        required: true
+        default: "warning"
+
+jobs:
+  golangci:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sandbox markers
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .mock
+          persist-credentials: false
+      - name: Mock golangci
+        working-directory: ${{ github.workspace }}
+        env:
+          MOCK_JOB: golangci
+          MOCK_MATRIX: ${{ toJSON(matrix) }}
+        run: |
+          echo "mock: $GITHUB_WORKFLOW / $MOCK_JOB on $GITHUB_EVENT_NAME at $GITHUB_SHA"
+          echo "matrix: $MOCK_MATRIX"
+          sleep "$(cat .mock/sleep 2>/dev/null || echo 15)"
+          if [ -f .mock/fail ] && grep -qxE "($GITHUB_EVENT_NAME/)?$MOCK_JOB" .mock/fail; then
+            echo "::error::.mock/fail makes $MOCK_JOB fail on $GITHUB_EVENT_NAME"
+            exit 1
+          fi
+  build-check:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sandbox markers
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .mock
+          persist-credentials: false
+      - name: Mock build-check
+        working-directory: ${{ github.workspace }}
+        env:
+          MOCK_JOB: build-check
+          MOCK_MATRIX: ${{ toJSON(matrix) }}
+        run: |
+          echo "mock: $GITHUB_WORKFLOW / $MOCK_JOB on $GITHUB_EVENT_NAME at $GITHUB_SHA"
+          echo "matrix: $MOCK_MATRIX"
+          sleep "$(cat .mock/sleep 2>/dev/null || echo 15)"
+          if [ -f .mock/fail ] && grep -qxE "($GITHUB_EVENT_NAME/)?$MOCK_JOB" .mock/fail; then
+            echo "::error::.mock/fail makes $MOCK_JOB fail on $GITHUB_EVENT_NAME"
+            exit 1
+          fi

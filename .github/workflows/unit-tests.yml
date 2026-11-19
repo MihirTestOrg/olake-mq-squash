@@ -1,0 +1,58 @@
+name: Unit Tests
+
+on:
+  pull_request:
+  merge_group:
+    types: [checks_requested]
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    name: Run Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sandbox markers
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .mock
+          persist-credentials: false
+      - name: Mock unit-tests
+        working-directory: ${{ github.workspace }}
+        env:
+          MOCK_JOB: unit-tests
+          MOCK_MATRIX: ${{ toJSON(matrix) }}
+        run: |
+          echo "mock: $GITHUB_WORKFLOW / $MOCK_JOB on $GITHUB_EVENT_NAME at $GITHUB_SHA"
+          echo "matrix: $MOCK_MATRIX"
+          sleep "$(cat .mock/sleep 2>/dev/null || echo 15)"
+          if [ -f .mock/fail ] && grep -qxE "($GITHUB_EVENT_NAME/)?$MOCK_JOB" .mock/fail; then
+            echo "::error::.mock/fail makes $MOCK_JOB fail on $GITHUB_EVENT_NAME"
+            exit 1
+          fi
+  java-unit-tests:
+    name: Run Java Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sandbox markers
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .mock
+          persist-credentials: false
+      - name: Mock java-unit-tests
+        working-directory: ${{ github.workspace }}
+        env:
+          MOCK_JOB: java-unit-tests
+          MOCK_MATRIX: ${{ toJSON(matrix) }}
+        run: |
+          echo "mock: $GITHUB_WORKFLOW / $MOCK_JOB on $GITHUB_EVENT_NAME at $GITHUB_SHA"
+          echo "matrix: $MOCK_MATRIX"
+          sleep "$(cat .mock/sleep 2>/dev/null || echo 15)"
+          if [ -f .mock/fail ] && grep -qxE "($GITHUB_EVENT_NAME/)?$MOCK_JOB" .mock/fail; then
+            echo "::error::.mock/fail makes $MOCK_JOB fail on $GITHUB_EVENT_NAME"
+            exit 1
+          fi

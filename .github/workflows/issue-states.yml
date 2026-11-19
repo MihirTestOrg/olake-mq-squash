@@ -1,0 +1,33 @@
+name: 'Issue States'
+
+on:
+  project_card:
+    types: [created, edited, moved]
+
+permissions:
+  repository-projects: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  action:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sandbox markers
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .mock
+          persist-credentials: false
+      - name: Mock action
+        working-directory: ${{ github.workspace }}
+        env:
+          MOCK_JOB: action
+          MOCK_MATRIX: ${{ toJSON(matrix) }}
+        run: |
+          echo "mock: $GITHUB_WORKFLOW / $MOCK_JOB on $GITHUB_EVENT_NAME at $GITHUB_SHA"
+          echo "matrix: $MOCK_MATRIX"
+          sleep "$(cat .mock/sleep 2>/dev/null || echo 15)"
+          if [ -f .mock/fail ] && grep -qxE "($GITHUB_EVENT_NAME/)?$MOCK_JOB" .mock/fail; then
+            echo "::error::.mock/fail makes $MOCK_JOB fail on $GITHUB_EVENT_NAME"
+            exit 1
+          fi

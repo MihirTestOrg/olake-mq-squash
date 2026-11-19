@@ -1,0 +1,53 @@
+name: Olake Driver Build And Release
+on:
+  workflow_dispatch:
+    inputs:
+      driver:
+        description: "Driver to build"
+        required: true
+      version:
+        description: "Version to release"
+        required: true
+  workflow_call:
+    inputs:
+      driver:
+        description: "Driver to build"
+        required: true
+        type: string
+        default: ""
+      version:
+        description: "Version to release"
+        required: true
+        type: string
+        default: ""
+
+jobs:
+  publish_drivers:
+    name: Publish driver ${{ github.event.inputs.driver }} [manual]
+    environment: Publish Driver
+    runs-on: ubuntu-latest
+    env:
+      DOCKER_LOGIN: ${{ secrets.DOCKER_USERNAME }}
+      DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+      DHID: ${{ secrets.DOCKER_REPO || 'olakego' }}
+      DRIVER: ${{ inputs.driver || github.event.inputs.driver || 'mongodb' }}
+      VERSION: ${{ inputs.version || github.event.inputs.version || 'v0.0.0.dev' }}
+    steps:
+      - name: Checkout sandbox markers
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .mock
+          persist-credentials: false
+      - name: Mock publish_drivers
+        working-directory: ${{ github.workspace }}
+        env:
+          MOCK_JOB: publish_drivers
+          MOCK_MATRIX: ${{ toJSON(matrix) }}
+        run: |
+          echo "mock: $GITHUB_WORKFLOW / $MOCK_JOB on $GITHUB_EVENT_NAME at $GITHUB_SHA"
+          echo "matrix: $MOCK_MATRIX"
+          sleep "$(cat .mock/sleep 2>/dev/null || echo 15)"
+          if [ -f .mock/fail ] && grep -qxE "($GITHUB_EVENT_NAME/)?$MOCK_JOB" .mock/fail; then
+            echo "::error::.mock/fail makes $MOCK_JOB fail on $GITHUB_EVENT_NAME"
+            exit 1
+          fi

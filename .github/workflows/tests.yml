@@ -1,0 +1,233 @@
+name: Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      baseline:
+        description: 'Compat baseline: a release tag (v0.6.5), a full image ref, or a commit sha. Empty = all the older releases with a state version update.'
+        required: false
+        default: ''
+        type: string
+  push:
+    branches:
+      - "master"
+      - "staging"
+    paths: &paths
+      - '**/*.go'
+      - '**/go.mod'
+      - '**/go.work'
+      - '**/*.java'
+      - '**/pom.xml'
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'Makefile'
+      - 'drivers/*/driver.mk'
+      - 'drivers/**.conf'
+      - 'constants/state-versions.json'
+      - 'tests/**'
+      - 'drivers/*/docker-compose.yml'
+      - 'destination/iceberg/local-test/**'
+      - '.golangci.yml'
+      - '.github/actions/**'
+      - '.github/scripts/**'
+      - '.github/workflows/tests.yml'
+      - '.github/workflows/test-preflight.yml'
+  pull_request:
+    branches:
+      - "*"
+    paths: *paths
+  merge_group:
+    types: [checks_requested]
+
+jobs:
+  preflight:
+    name: Pre-Validation
+    uses: ./.github/workflows/test-preflight.yml
+    permissions:
+      contents: read
+      pull-requests: read
+      packages: read
+      actions: read
+    with:
+      go-checks: true
+    secrets: inherit
+
+  approve:
+    name: Approve Test Deployment
+    needs: preflight
+    if: needs.preflight.outputs.drivers != '[]' && needs.preflight.outputs.redundant != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: ${{ github.event_name == 'pull_request' && !(github.head_ref == 'staging' && github.base_ref == 'master') && 'integration_tests' || '' }}
+    outputs:
+      attempt: ${{ github.run_attempt }}
+      drivers: ${{ needs.preflight.outputs.drivers }}
+      sources: ${{ needs.preflight.outputs.sources }}
+      drivers-with-compatibility-tests: ${{ needs.preflight.outputs.drivers-with-compatibility-tests }}
+      base-image-misses: ${{ needs.preflight.outputs.base-image-misses }}
+    steps:
+      - run: echo "Approved -- running the end to end tests"
+
+  integration-tests:
+    name: Integration Test ${{ matrix.name }}
+    needs: approve
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+    runs-on: ubuntu-latest
+    environment: ${{ github.event_name == 'pull_request' && needs.approve.outputs.attempt != github.run_attempt && !(github.head_ref == 'staging' && github.base_ref == 'master') && 'integration_tests' || '' }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.approve.outputs.sources) }}
+    steps:
+      - name: Checkout sandbox markers
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .mock
+          persist-credentials: false
+      - name: Mock integration-tests
+        working-directory: ${{ github.workspace }}
+        env:
+          MOCK_JOB: integration-tests
+          MOCK_MATRIX: ${{ toJSON(matrix) }}
+        run: |
+          echo "mock: $GITHUB_WORKFLOW / $MOCK_JOB on $GITHUB_EVENT_NAME at $GITHUB_SHA"
+          echo "matrix: $MOCK_MATRIX"
+          sleep "$(cat .mock/sleep 2>/dev/null || echo 15)"
+          if [ -f .mock/fail ] && grep -qxE "($GITHUB_EVENT_NAME/)?$MOCK_JOB" .mock/fail; then
+            echo "::error::.mock/fail makes $MOCK_JOB fail on $GITHUB_EVENT_NAME"
+            exit 1
+          fi
+  base-images:
+    name: Build base branch driver images
+    needs: approve
+    if: (github.event_name == 'pull_request' || github.event_name == 'merge_group') && needs.approve.outputs.base-image-misses != '' && needs.approve.outputs.base-image-misses != '[]'
+    runs-on: ubuntu-latest
+    environment: ${{ github.event_name == 'pull_request' && needs.approve.outputs.attempt != github.run_attempt && !(github.head_ref == 'staging' && github.base_ref == 'master') && 'integration_tests' || '' }}
+    permissions:
+      contents: read
+      packages: write
+    timeout-minutes: 30
+    steps:
+      - name: Checkout sandbox markers
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .mock
+          persist-credentials: false
+      - name: Mock base-images
+        working-directory: ${{ github.workspace }}
+        env:
+          MOCK_JOB: base-images
+          MOCK_MATRIX: ${{ toJSON(matrix) }}
+        run: |
+          echo "mock: $GITHUB_WORKFLOW / $MOCK_JOB on $GITHUB_EVENT_NAME at $GITHUB_SHA"
+          echo "matrix: $MOCK_MATRIX"
+          sleep "$(cat .mock/sleep 2>/dev/null || echo 15)"
+          if [ -f .mock/fail ] && grep -qxE "($GITHUB_EVENT_NAME/)?$MOCK_JOB" .mock/fail; then
+            echo "::error::.mock/fail makes $MOCK_JOB fail on $GITHUB_EVENT_NAME"
+            exit 1
+          fi
+  test-backward-compatibility:
+    name: Backward Compatibility with ${{ github.event.pull_request.base.ref || github.event.merge_group.base_ref }}
+    needs: [approve, integration-tests, base-images]
+    if: ${{ !cancelled() && needs.approve.outputs.drivers-with-compatibility-tests != '[]' && needs.integration-tests.result == 'success' && (needs.base-images.result == 'success' || needs.base-images.result == 'skipped') }}
+    permissions:
+      contents: read
+      packages: write
+      actions: read
+    strategy:
+      matrix:
+        baseline: ${{ fromJSON(github.event_name == 'pull_request' && format('["{0}"]', github.event.pull_request.base.sha) || github.event_name == 'merge_group' && format('["{0}"]', github.event.merge_group.base_sha) || '[]') }}
+    runs-on: ubuntu-latest
+    environment: ${{ github.event_name == 'pull_request' && needs.approve.outputs.attempt != github.run_attempt && !(github.head_ref == 'staging' && github.base_ref == 'master') && 'integration_tests' || '' }}
+    timeout-minutes: 90
+    env:
+      DRIVERS: ${{ join(fromJSON(needs.approve.outputs.drivers-with-compatibility-tests), ' ') }}
+    steps:
+      - name: Checkout sandbox markers
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .mock
+          persist-credentials: false
+      - name: Mock test-backward-compatibility
+        working-directory: ${{ github.workspace }}
+        env:
+          MOCK_JOB: test-backward-compatibility
+          MOCK_MATRIX: ${{ toJSON(matrix) }}
+        run: |
+          echo "mock: $GITHUB_WORKFLOW / $MOCK_JOB on $GITHUB_EVENT_NAME at $GITHUB_SHA"
+          echo "matrix: $MOCK_MATRIX"
+          sleep "$(cat .mock/sleep 2>/dev/null || echo 15)"
+          if [ -f .mock/fail ] && grep -qxE "($GITHUB_EVENT_NAME/)?$MOCK_JOB" .mock/fail; then
+            echo "::error::.mock/fail makes $MOCK_JOB fail on $GITHUB_EVENT_NAME"
+            exit 1
+          fi
+  backward-compatibility-with-old-releases:
+    name: Backward Compatibility with Older Releases
+    needs: approve
+    if: (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.base_ref == 'master')) && needs.approve.outputs.drivers-with-compatibility-tests != '[]'
+    runs-on: ubuntu-latest
+    environment: ${{ github.event_name == 'pull_request' && needs.approve.outputs.attempt != github.run_attempt && !(github.head_ref == 'staging' && github.base_ref == 'master') && 'integration_tests' || '' }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        driver: ${{ fromJSON(needs.approve.outputs.drivers-with-compatibility-tests) }}
+    steps:
+      - name: Checkout sandbox markers
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .mock
+          persist-credentials: false
+      - name: Mock backward-compatibility-with-old-releases
+        working-directory: ${{ github.workspace }}
+        env:
+          MOCK_JOB: backward-compatibility-with-old-releases
+          MOCK_MATRIX: ${{ toJSON(matrix) }}
+        run: |
+          echo "mock: $GITHUB_WORKFLOW / $MOCK_JOB on $GITHUB_EVENT_NAME at $GITHUB_SHA"
+          echo "matrix: $MOCK_MATRIX"
+          sleep "$(cat .mock/sleep 2>/dev/null || echo 15)"
+          if [ -f .mock/fail ] && grep -qxE "($GITHUB_EVENT_NAME/)?$MOCK_JOB" .mock/fail; then
+            echo "::error::.mock/fail makes $MOCK_JOB fail on $GITHUB_EVENT_NAME"
+            exit 1
+          fi
+  performance-tests:
+    name: Performance Test
+    needs: approve
+    if: github.head_ref == 'staging' && github.base_ref == 'master'
+    environment: Performance Testing
+    permissions:
+      actions: read
+      id-token: write
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    concurrency:
+      group: performance-tests-${{ matrix.driver }}
+      cancel-in-progress: true
+    strategy:
+      fail-fast: false
+      # TODO: add benchmark tests for mongodb and oracle (instance ids TBD).
+      matrix:
+        include: ${{ fromJSON('[{"driver":"mysql","driver_upper":"MYSQL","instance_id":8},{"driver":"postgres","driver_upper":"POSTGRES","instance_id":9}]') }}
+
+    steps:
+      - name: Checkout sandbox markers
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .mock
+          persist-credentials: false
+      - name: Mock performance-tests
+        working-directory: ${{ github.workspace }}
+        env:
+          MOCK_JOB: performance-tests
+          MOCK_MATRIX: ${{ toJSON(matrix) }}
+        run: |
+          echo "mock: $GITHUB_WORKFLOW / $MOCK_JOB on $GITHUB_EVENT_NAME at $GITHUB_SHA"
+          echo "matrix: $MOCK_MATRIX"
+          sleep "$(cat .mock/sleep 2>/dev/null || echo 15)"
+          if [ -f .mock/fail ] && grep -qxE "($GITHUB_EVENT_NAME/)?$MOCK_JOB" .mock/fail; then
+            echo "::error::.mock/fail makes $MOCK_JOB fail on $GITHUB_EVENT_NAME"
+            exit 1
+          fi
