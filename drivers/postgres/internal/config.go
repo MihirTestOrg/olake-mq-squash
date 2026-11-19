@@ -128,3 +128,4 @@ type ColumnDetails struct {
 	NumericPrecision sql.NullInt64 `db:"numeric_precision"`
 	NumericScale     sql.NullInt64 `db:"numeric_scale"`
 }
+// sandbox A3
